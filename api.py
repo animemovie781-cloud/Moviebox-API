@@ -247,8 +247,7 @@ class MovieBoxEngine:
                 headers={
                     "accept": "*/*",
                     "Content-Type": "application/json",
-                    "X-Gslb-Sign": gslb_signature,
-                    "User-Agent": "okhttp/4.11.0",
+                    "X-Gslb-Sign": gslb_signature,                    "User-Agent": "okhttp/4.11.0",
                 },
                 data=body.encode("utf-8"),
                 timeout=12,
@@ -498,7 +497,6 @@ class MovieBoxEngine:
                 "resolutions": s.get("resolutions", [])
             })
         return season_list
-
     def get_streams(self, subject_id: str, season: int = 0, episode: int = 0, detail_path: Optional[str] = None) -> List[Dict[str, Any]]:
         if not detail_path:
             try:
@@ -747,8 +745,7 @@ def get_detail(subject_id: str):
     return engine.get_details(subject_id)
 
 @app.get("/episodes/{subject_id}")
-def get_episodes(subject_id: str):
-    return {"subject_id": subject_id, "seasons": engine.get_episodes(subject_id)}
+def get_episodes(subject_id: str):    return {"subject_id": subject_id, "seasons": engine.get_episodes(subject_id)}
 
 @app.get("/api/stream/{subject_id}")
 def get_streams(subject_id: str, se: int = 0, ep: int = 0, detail_path: Optional[str] = None):
@@ -885,6 +882,77 @@ def get_home():
     url = f"{API_BASE}/home?host=moviebox.ph"
     resp = engine.session.get(url, headers={"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}, timeout=20)
     return resp.json()
+
+
+@app.get("/api/stream/{subject_id}/diagnostics")
+def diagnose_streams(subject_id: str, se: int = 0, ep: int = 0):
+    """Check provider-returned stream URLs with a one-byte Range request.
+    This is diagnostic only: it does not proxy media or bypass provider controls.
+    """
+    from urllib.parse import urlsplit
+
+    results = []
+    candidates = engine.get_streams(subject_id, season=se, episode=ep)
+    for index, stream in enumerate(candidates[:12]):
+        raw_url = str(stream.get("url") or "")
+        parsed = urlsplit(raw_url)
+        item = {
+            "index": index,
+            "quality": stream.get("quality"),
+            "format": stream.get("format"),
+            "codec": stream.get("codec"),
+            "host": parsed.hostname,
+            "status": None,
+            "content_type": None,
+            "accept_ranges": None,
+            "range_supported": False,
+            "cors": None,
+            "playable_candidate": False,
+            "error": None,
+        }
+        if parsed.scheme != "https" or not parsed.hostname:
+            item["error"] = "Rejected non-HTTPS or invalid provider URL"
+            results.append(item)
+            continue
+        try:
+            request_headers = dict(stream.get("headers") or {})
+            request_headers["Range"] = "bytes=0-0"
+            request_headers["Accept-Encoding"] = "identity"
+            response = engine.session.get(
+                raw_url,
+                headers=request_headers,
+                timeout=12,
+                stream=True,
+            )
+            item["status"] = int(response.status_code)
+            item["content_type"] = response.headers.get("content-type")
+            item["accept_ranges"] = response.headers.get("accept-ranges")
+            item["cors"] = response.headers.get("access-control-allow-origin")
+            item["range_supported"] = (
+                response.status_code == 206
+                or "bytes" in str(item["accept_ranges"] or "").lower()
+            )
+            item["playable_candidate"] = (
+                response.status_code in (200, 206)
+                and (
+                    "video/" in str(item["content_type"] or "").lower()
+                    or "application/octet-stream" in str(item["content_type"] or "").lower()
+                    or "dash+xml" in str(item["content_type"] or "").lower()
+                    or "mpegurl" in str(item["content_type"] or "").lower()
+                )
+            )
+            response.close()
+        except Exception as exc:
+            item["error"] = type(exc).__name__ + ": " + str(exc)[:180]
+        results.append(item)
+    return {
+        "subject_id": subject_id,
+        "season": se,
+        "episode": ep,
+        "checked": len(results),
+        "results": results,
+        "note": "A successful server-side probe does not guarantee browser playback; the CDN must also allow browser CORS and required codecs.",
+    }
 
 if __name__ == "__main__":
     import uvicorn
