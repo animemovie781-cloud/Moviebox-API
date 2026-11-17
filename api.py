@@ -222,7 +222,7 @@ class MovieBoxEngine:
         except Exception as exc:
             raise HTTPException(
                 status_code=502,
-                detail=f"MovieBox guest bootstrap request failed: {type(exc).__name__}"
+                detail=f"MovieBox guest bootstrap request failed: HTTP status {getattr(getattr(exc, 'response', None), 'status_code', 'unknown')}; {type(exc).__name__}"
             ) from exc
 
         x_user = next(
