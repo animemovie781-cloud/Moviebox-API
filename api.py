@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from playback import classify_stream, filter_streams
 
 try:
     from curl_cffi import requests as cr
@@ -34,7 +35,7 @@ if sys.stderr and hasattr(sys.stderr, "reconfigure"):
 app = FastAPI(
     title="MovieBox 1080p API",
     description="REST API for MovieBox with 1080p Stream & Subtitle Extraction",
-    version="2.5.0"
+    version="2.6.0"
 )
 
 app.add_middleware(
@@ -1286,6 +1287,66 @@ def get_captions(subject_id: str, se: int = 0, ep: int = 0, stream_id: Optional[
         "count": len(subs),
         "captions": subs
     }
+
+
+@app.get("/api/stream/{subject_id}/sources")
+def get_stream_sources(
+    subject_id: str,
+    se: int = 0,
+    ep: int = 0,
+    format: str = Query("all", pattern="^(all|mp4|hls|dash)$"),
+    quality: Optional[int] = Query(None, ge=144, le=4320),
+):
+    """Return normalized playback sources without rewriting protected CDN URLs."""
+    streams = engine.get_streams(subject_id, season=se, episode=ep)
+    normalized = [classify_stream(item) for item in streams]
+    selected = filter_streams(normalized, media_format=format, quality=quality)
+    return {
+        "subject_id": subject_id,
+        "season": se,
+        "episode": ep,
+        "format_filter": format,
+        "quality_filter": quality,
+        "count": len(selected),
+        "recommended": next(
+            (item for item in selected if item.get("direct_playback") and item.get("codec_family") == "h264"),
+            selected[0] if selected else None,
+        ),
+        "sources": selected,
+        "playback_notes": {
+            "mp4": "For VLC or a basic HTML5 player, prefer a direct MP4 source. The source may still require the provider's allowed request headers.",
+            "hls": "Use an HLS-capable player such as hls.js; the CDN must permit CORS.",
+            "dash": "Use a DASH-capable player such as dash.js. A .mpd manifest is not a single MP4 file.",
+            "codec": "H.264 has broader browser compatibility than H.265/HEVC. Browser support also depends on device, browser, and CDN CORS policy.",
+        },
+    }
+
+
+@app.get("/api/stream/{subject_id}/vlc")
+def get_vlc_sources(subject_id: str, se: int = 0, ep: int = 0):
+    """List direct MP4 candidates for external players; does not proxy or bypass access controls."""
+    streams = engine.get_streams(subject_id, season=se, episode=ep)
+    normalized = [classify_stream(item) for item in streams]
+    mp4_sources = filter_streams(normalized, media_format="mp4")
+    return {
+        "subject_id": subject_id,
+        "season": se,
+        "episode": ep,
+        "count": len(mp4_sources),
+        "sources": mp4_sources,
+        "note": "Choose a direct MP4 source. DASH .mpd manifests can contain multiple representations and are not equivalent to a single media file. If a provider requires authorization headers or denies the current region, this API cannot remove that restriction.",
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "MovieBox API",
+        "version": "2.6.0",
+        "features": ["search", "metadata", "episodes", "normalized-stream-sources", "direct-mp4-list", "captions"],
+    }
+
 
 @app.get("/movies")
 def get_movies(page: int = 1, per_page: int = 24, sort: str = "RECOMMEND"):
