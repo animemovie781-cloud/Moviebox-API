@@ -596,19 +596,41 @@ class MovieBoxEngine:
                 continue
 
         try:
-            native_url = f"/wefeed-mobile-bff/subject-api/play-info?subjectId={subject_id}&se={season}&ep={episode}"
-            native_data = self.api_request("GET", native_url).get("data", {})
-            for st in native_data.get("streams", []):
-                raw_url = st.get("url")
-                if not raw_url or "b164fbfb4347792950bdfbfb563d39d9" in raw_url:
+            # Match Anime-'s current Android client: play-info/v2, 1-based
+            # season/episode values, and streamList (with streams fallback).
+            native_url = (
+                f"/wefeed-mobile-bff/subject-api/play-info/v2"
+                f"?subjectId={subject_id}&se={max(1, season)}&ep={max(1, episode)}"
+                f"&host=api6.aoneroom.com"
+            )
+            native_response = self.api_request("GET", native_url)
+            native_data = native_response.get("data", {}) if isinstance(native_response, dict) else {}
+            raw_native_streams = (
+                native_data.get("streamList")
+                or native_data.get("streams")
+                or []
+            )
+            global_cookie = (
+                native_response.get("signCookie")
+                or native_data.get("signCookie")
+                or ""
+            ) if isinstance(native_response, dict) else ""
+            for st in raw_native_streams:
+                if not isinstance(st, dict):
                     continue
-                cookie = st.get("signCookie")
+                raw_url = st.get("url")
+                if not raw_url or any(x in str(raw_url) for x in (
+                    "b164fbfb4347792950bdfbfb563d39d9",
+                    "please_update", "update_app"
+                )):
+                    continue
+                cookie = st.get("signCookie") or global_cookie
                 policy_url = extract_policy_resource(cookie) if cookie else None
                 final_url = policy_url or raw_url
                 if final_url in seen_urls:
                     continue
                 seen_urls.add(final_url)
-                res_str = str(st.get("resolutions", ""))
+                res_str = str(st.get("resolutions") or st.get("resolution") or "")
                 quality_val = 0
                 for q in (2160, 1440, 1080, 720, 480, 360, 240):
                     if str(q) in res_str:
@@ -618,13 +640,13 @@ class MovieBoxEngine:
                 size_mb = size_bytes / (1024 * 1024) if size_bytes else 0
                 streams.append({
                     "source": "Mobile Native CDN",
-                    "format": "DASH" if (policy_url or ".mpd" in final_url) else st.get("format", "MP4"),
+                    "format": "DASH" if (policy_url or ".mpd" in str(final_url)) else st.get("format", "MP4"),
                     "quality": f"{quality_val}p" if quality_val else (res_str or "Default"),
                     "quality_value": quality_val,
                     "resolution_tag": res_str,
                     "url": final_url,
                     "size_mb": round(size_mb, 1),
-                    "codec": st.get("codecName"),
+                    "codec": st.get("codecName") or st.get("codec"),
                     "duration_sec": st.get("duration"),
                     "headers": {
                         "User-Agent": MODERN_USER_AGENT,
