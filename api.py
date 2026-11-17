@@ -198,10 +198,13 @@ class MovieBoxEngine:
     def __init__(self):
         self.device_id = generate_device_id()
         self.bearer_token: Optional[str] = None
+        self.api_base = NATIVE_API_BASE.rstrip("/")
+        self.bootstrap_host = BOOTSTRAP_HOST.rstrip("/")
         if cr:
             self.session = cr.Session(impersonate="chrome120")
         else:
             self.session = httpx.Client(timeout=25, follow_redirects=True)
+        self.resolve_api_domain()
 
     @classmethod
     def get_instance(cls) -> "MovieBoxEngine":
@@ -209,30 +212,99 @@ class MovieBoxEngine:
             cls._instance = MovieBoxEngine()
         return cls._instance
 
+    def resolve_api_domain(self) -> None:
+        """Ask MovieBox's official GSLB for the current API host mapping."""
+        package_name = "com.community.oneroom"
+        device_hash = hashlib.sha256(self.device_id.encode("utf-8")).hexdigest()
+        payload = {
+            "appId": package_name,
+            "key": device_hash,
+            "oldKey": "",
+            "domains": ["apig.inmoviebox.com", "api.inmoviebox.com"],
+            "mcc": "404",
+            "locale": "IN",
+            "language": "en",
+            "model": "Pixel 8",
+        }
+        body = json.dumps(payload, separators=(",", ":"))
+        gslb_signature = hashlib.sha256(
+            (package_name + device_hash).encode("utf-8")
+        ).hexdigest()
+        try:
+            response = self.session.post(
+                "https://gslb.shalltry.com/gslb/domain/convert",
+                headers={
+                    "accept": "*/*",
+                    "Content-Type": "application/json",
+                    "X-Gslb-Sign": gslb_signature,
+                    "User-Agent": "okhttp/4.11.0",
+                },
+                data=body.encode("utf-8"),
+                timeout=12,
+            )
+            if response.status_code != 200:
+                return
+            payload_out = response.json()
+            mapping = payload_out.get("data", {}) if isinstance(payload_out, dict) else {}
+            mapped_host = mapping.get("apig.inmoviebox.com") or mapping.get("api.inmoviebox.com")
+            if isinstance(mapped_host, str) and mapped_host.strip():
+                mapped_host = re.sub(r"^https?://", "", mapped_host.strip()).strip("/")
+                if "/" not in mapped_host and " " not in mapped_host:
+                    self.api_base = f"https://{mapped_host}"
+                    self.bootstrap_host = self.api_base
+        except Exception:
+            # Keep the configured official hosts; GSLB is an optional discovery step.
+            return
+
     def bootstrap_token(self, force: bool = False) -> str:
         if self.bearer_token and not force:
             return self.bearer_token
 
-        # Use MovieBox's visitor-login endpoint to obtain a guest JWT.
-        # The older tab-operating x-user handshake is returning HTTP 403.
-        url = f"{BOOTSTRAP_HOST}/wefeed-mobile-bff/user-api/visitor-login"
-        body = "{}"
-        headers = build_auth_headers(
-            "POST",
-            url,
-            body=body,
-            device_id=self.device_id,
+        # First make an anonymous app request. MovieBox may issue a guest JWT
+        # in the x-user response header; this is the handshake used by its client.
+        url = (
+            f"{self.bootstrap_host}/wefeed-mobile-bff/tab-operating"
+            "?host=api.inmoviebox.com&page=1&pageSize=24&tabId=1"
         )
-        headers["content-type"] = "application/json;charset=UTF-8"
-        headers["referer"] = f"{BOOTSTRAP_HOST}/"
-        headers["x-client-status"] = "0"
-
+        headers = build_auth_headers(
+            "GET", url, device_id=self.device_id, content_type="application/json;charset=UTF-8"
+        )
+        headers["x-client-status"] = "1"
+        headers.pop("authorization", None)
         try:
-            resp = self.session.post(
-                url,
-                headers=headers,
-                data=body.encode("utf-8"),
-                timeout=25,
+            resp = self.session.get(url, headers=headers, timeout=25)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"MovieBox guest bootstrap network error: {type(exc).__name__}"
+            ) from exc
+
+        x_user = next(
+            (value for key, value in resp.headers.items() if key.lower() == "x-user"),
+            None,
+        )
+        if x_user:
+            try:
+                user_data = json.loads(x_user)
+                token = user_data.get("token") if isinstance(user_data, dict) else None
+                if token:
+                    self.bearer_token = token
+                    return token
+            except (TypeError, json.JSONDecodeError):
+                pass
+
+        # Some API versions return the guest token in visitor-login JSON.
+        login_url = f"{self.api_base}/wefeed-mobile-bff/user-api/visitor-login"
+        body = "{}"
+        login_headers = build_auth_headers(
+            "POST", login_url, body=body, device_id=self.device_id,
+            content_type="application/json;charset=UTF-8"
+        )
+        login_headers["x-client-status"] = "1"
+        login_headers.pop("authorization", None)
+        try:
+            login_resp = self.session.post(
+                login_url, headers=login_headers, data=body.encode("utf-8"), timeout=25
             )
         except Exception as exc:
             raise HTTPException(
@@ -240,29 +312,48 @@ class MovieBoxEngine:
                 detail=f"MovieBox visitor-login network error: {type(exc).__name__}"
             ) from exc
 
-        if resp.status_code < 200 or resp.status_code >= 300:
-            upstream_text = re.sub(r"\\s+", " ", (resp.text or ""))[:240]
+        if login_resp.status_code < 200 or login_resp.status_code >= 300:
+            try:
+                error_payload = login_resp.json()
+            except Exception:
+                error_payload = {}
+            upstream_message = (
+                error_payload.get("message") or error_payload.get("msg")
+                if isinstance(error_payload, dict) else None
+            )
+            if login_resp.status_code == 403 and (
+                "region" in (login_resp.text or "").lower()
+                or "current region" in (login_resp.text or "").lower()
+            ):
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "message": "MovieBox is unavailable from the current hosting region",
+                        "upstream_status": 403,
+                        "upstream_message": upstream_message or "Service not available in current region",
+                        "api_host": urlsplit(self.api_base).netloc,
+                    },
+                )
             raise HTTPException(
                 status_code=502,
                 detail={
                     "message": "MovieBox visitor-login rejected the request",
-                    "upstream_status": resp.status_code,
-                    "upstream_body": upstream_text,
+                    "upstream_status": login_resp.status_code,
+                    "upstream_message": upstream_message,
+                    "api_host": urlsplit(self.api_base).netloc,
                 },
             )
 
         try:
-            payload = resp.json()
+            payload = login_resp.json()
         except ValueError as exc:
             raise HTTPException(status_code=502, detail="MovieBox visitor-login returned non-JSON data") from exc
 
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
         token = data.get("token") if isinstance(data, dict) else None
-
-        # Some gateway versions issue the token in x-user instead of the JSON body.
         if not token:
             x_user = next(
-                (value for key, value in resp.headers.items() if key.lower() == "x-user"),
+                (value for key, value in login_resp.headers.items() if key.lower() == "x-user"),
                 None,
             )
             if x_user:
@@ -271,14 +362,11 @@ class MovieBoxEngine:
                     token = user_data.get("token") if isinstance(user_data, dict) else None
                 except (TypeError, json.JSONDecodeError):
                     token = None
-
         if not token:
-            message = payload.get("msg") or payload.get("message") if isinstance(payload, dict) else None
             raise HTTPException(
                 status_code=502,
-                detail=f"MovieBox visitor-login did not return a guest token: {message or 'token missing'}",
+                detail="MovieBox guest bootstrap completed but no token was returned",
             )
-
         self.bearer_token = token
         return token
 
@@ -286,7 +374,7 @@ class MovieBoxEngine:
         if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
             full_url = path_or_url
         else:
-            full_url = f"{NATIVE_API_BASE}{path_or_url}"
+            full_url = f"{self.api_base}{path_or_url}"
         if use_token and not self.bearer_token:
             self.bootstrap_token()
         body_str = json.dumps(body_dict, separators=(",", ":")) if body_dict is not None else None
@@ -311,14 +399,31 @@ class MovieBoxEngine:
 
     def search(self, query: str, page: int = 1, per_page: int = 20) -> List[Dict[str, Any]]:
         payload = {"keyword": query, "page": page, "perPage": per_page}
-        url = "/wefeed-mobile-bff/subject-api/search"
-        data = self.api_request("POST", url, body_dict=payload).get("data", {})
-        raw_items = data.get("items", []) or data.get("list", [])
+        data = {}
+        last_error = None
+        for url in (
+            "/wefeed-mobile-bff/subject-api/search/v2",
+            "/wefeed-mobile-bff/subject-api/search",
+        ):
+            try:
+                response_data = self.api_request("POST", url, body_dict=payload)
+                data = response_data.get("data", {}) if isinstance(response_data, dict) else {}
+                raw_items = data.get("items", []) or data.get("list", []) if isinstance(data, dict) else []
+                if raw_items:
+                    break
+            except HTTPException as exc:
+                last_error = exc
+                continue
+        else:
+            if last_error:
+                raise last_error
+            raw_items = []
+        raw_items = raw_items or (data.get("items", []) if isinstance(data, dict) else [])
         results = []
         for item in raw_items:
             sub = item.get("subject", item)
             results.append({
-                "subject_id": str(sub.get("subjectId")),
+                "subject_id": str(sub.get("subjectId")) if sub.get("subjectId") is not None else None,
                 "title": sub.get("title"),
                 "type": "Movie" if sub.get("subjectType") == 1 else "Series",
                 "subject_type": sub.get("subjectType"),
@@ -329,7 +434,7 @@ class MovieBoxEngine:
                 "detail_path": sub.get("detailPath"),
                 "language": sub.get("language")
             })
-        return results
+        return [item for item in results if item.get("subject_id")]
 
     def get_details(self, subject_id: str) -> Dict[str, Any]:
         url = f"/wefeed-mobile-bff/subject-api/get?subjectId={subject_id}"
