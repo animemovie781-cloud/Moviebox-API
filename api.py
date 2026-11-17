@@ -213,36 +213,71 @@ class MovieBoxEngine:
         if self.bearer_token and not force:
             return self.bearer_token
 
-        headers = build_auth_headers("GET", BOOTSTRAP_URL, device_id=self.device_id)
-        # Guest bootstrap requests ask the gateway to allocate a fresh guest session.
-        headers["x-client-status"] = "1"
+        # Use MovieBox's visitor-login endpoint to obtain a guest JWT.
+        # The older tab-operating x-user handshake is returning HTTP 403.
+        url = f"{BOOTSTRAP_HOST}/wefeed-mobile-bff/user-api/visitor-login"
+        body = "{}"
+        headers = build_auth_headers(
+            "POST",
+            url,
+            body=body,
+            device_id=self.device_id,
+        )
+        headers["content-type"] = "application/json;charset=UTF-8"
+        headers["referer"] = f"{BOOTSTRAP_HOST}/"
+        headers["x-client-status"] = "0"
+
         try:
-            resp = self.session.get(BOOTSTRAP_URL, headers=headers, timeout=25)
-            resp.raise_for_status()
+            resp = self.session.post(
+                url,
+                headers=headers,
+                data=body.encode("utf-8"),
+                timeout=25,
+            )
         except Exception as exc:
             raise HTTPException(
                 status_code=502,
-                detail=f"MovieBox guest bootstrap request failed: HTTP status {getattr(getattr(exc, 'response', None), 'status_code', 'unknown')}; {type(exc).__name__}"
+                detail=f"MovieBox visitor-login network error: {type(exc).__name__}"
             ) from exc
 
-        x_user = next(
-            (value for key, value in resp.headers.items() if key.lower() == "x-user"),
-            None,
-        )
-        if not x_user:
+        if resp.status_code < 200 or resp.status_code >= 300:
+            upstream_text = re.sub(r"\\s+", " ", (resp.text or ""))[:240]
             raise HTTPException(
                 status_code=502,
-                detail=f"MovieBox guest token missing from upstream response (HTTP {resp.status_code})"
+                detail={
+                    "message": "MovieBox visitor-login rejected the request",
+                    "upstream_status": resp.status_code,
+                    "upstream_body": upstream_text,
+                },
             )
 
         try:
-            token_data = json.loads(x_user)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=502, detail="MovieBox returned an invalid x-user header") from exc
+            payload = resp.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="MovieBox visitor-login returned non-JSON data") from exc
 
-        token = token_data.get("token") if isinstance(token_data, dict) else None
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        token = data.get("token") if isinstance(data, dict) else None
+
+        # Some gateway versions issue the token in x-user instead of the JSON body.
         if not token:
-            raise HTTPException(status_code=502, detail="MovieBox x-user header did not contain a token")
+            x_user = next(
+                (value for key, value in resp.headers.items() if key.lower() == "x-user"),
+                None,
+            )
+            if x_user:
+                try:
+                    user_data = json.loads(x_user)
+                    token = user_data.get("token") if isinstance(user_data, dict) else None
+                except (TypeError, json.JSONDecodeError):
+                    token = None
+
+        if not token:
+            message = payload.get("msg") or payload.get("message") if isinstance(payload, dict) else None
+            raise HTTPException(
+                status_code=502,
+                detail=f"MovieBox visitor-login did not return a guest token: {message or 'token missing'}",
+            )
 
         self.bearer_token = token
         return token
