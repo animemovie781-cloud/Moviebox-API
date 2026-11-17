@@ -51,7 +51,7 @@ WEB_USER_AGENT = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (K
 API_BASE = "https://h5-api.aoneroom.com/wefeed-h5api-bff"
 NATIVE_API_BASE = "https://api3.aoneroom.com"
 BOOTSTRAP_HOST = "https://apig.inmoviebox.com"
-BOOTSTRAP_URL = f"{BOOTSTRAP_HOST}/wefeed-mobile-bff/tab/ranking-list?tabId=0&categoryType=4516404531735022304&page=1&perPage=1"
+BOOTSTRAP_URL = f"{BOOTSTRAP_HOST}/wefeed-mobile-bff/tab-operating?host=api.inmoviebox.com&page=1&pageSize=24&tabId=1"
 
 WEB_DOMAINS = [
     "https://123moviesfree.club",
@@ -212,15 +212,38 @@ class MovieBoxEngine:
     def bootstrap_token(self, force: bool = False) -> str:
         if self.bearer_token and not force:
             return self.bearer_token
+
         headers = build_auth_headers("GET", BOOTSTRAP_URL, device_id=self.device_id)
-        resp = self.session.get(BOOTSTRAP_URL, headers=headers, timeout=20)
-        x_user = resp.headers.get("x-user")
+        # Guest bootstrap requests ask the gateway to allocate a fresh guest session.
+        headers["x-client-status"] = "1"
+        try:
+            resp = self.session.get(BOOTSTRAP_URL, headers=headers, timeout=25)
+            resp.raise_for_status()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"MovieBox guest bootstrap request failed: {type(exc).__name__}"
+            ) from exc
+
+        x_user = next(
+            (value for key, value in resp.headers.items() if key.lower() == "x-user"),
+            None,
+        )
         if not x_user:
-            raise HTTPException(status_code=502, detail="Failed to bootstrap MovieBox token")
-        token_data = json.loads(x_user)
-        token = token_data.get("token")
+            raise HTTPException(
+                status_code=502,
+                detail=f"MovieBox guest token missing from upstream response (HTTP {resp.status_code})"
+            )
+
+        try:
+            token_data = json.loads(x_user)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=502, detail="MovieBox returned an invalid x-user header") from exc
+
+        token = token_data.get("token") if isinstance(token_data, dict) else None
         if not token:
-            raise HTTPException(status_code=502, detail="Empty token in upstream header")
+            raise HTTPException(status_code=502, detail="MovieBox x-user header did not contain a token")
+
         self.bearer_token = token
         return token
 
@@ -1040,21 +1063,17 @@ def search(q: str = Query(..., min_length=1), page: int = 1, per_page: int = 20)
 
 @app.get("/search/suggest")
 def search_suggest(q: str = Query(..., min_length=1)):
-    url = f"{API_BASE}/subject/search-suggest"
-    headers = {"User-Agent": WEB_USER_AGENT, "Referer": "https://moviebox.ph/"}
-    try:
-        resp = engine.session.post(url, headers=headers, json={"keyword": q, "perPage": 10}, timeout=15)
-        raw = resp.json().get("data", {}).get("items", [])
-    except Exception:
-        raw = []
-    suggestions = []
-    for item in raw:
-        sub = item.get("subject") or {}
-        suggestions.append({
-            "title": sub.get("title") or item.get("word") or item.get("title"),
-            "slug": sub.get("detailPath") or item.get("detailPath"),
-            "subject_id": str(sub.get("subjectId") or item.get("subjectId"))
-        })
+    # Use the authenticated catalog search so suggestions contain real subject IDs.
+    results = engine.search(q, page=1, per_page=10)
+    suggestions = [
+        {
+            "title": item.get("title"),
+            "slug": item.get("detail_path"),
+            "subject_id": item.get("subject_id"),
+        }
+        for item in results
+        if item.get("subject_id") and item.get("subject_id") != "None"
+    ]
     return {"suggestions": suggestions}
 
 @app.get("/detail/{subject_id}")
