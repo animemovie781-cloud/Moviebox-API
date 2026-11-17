@@ -85,23 +85,25 @@ def generate_x_client_token(timestamp: int) -> str:
     return f"{ts_str},{md5_hex(reversed_ts)}"
 
 def generate_client_info(device_id: str) -> str:
+    # Match the Android LocalMovieBoxServer client metadata from Anime-.
     return json.dumps(
         {
-            "package_name": "com.community.mbox.in",
-            "version_name": "4.0.03.0920.03",
-            "version_code": 50020130,
+            "package_name": "com.community.oneroom",
+            "version_name": "4.0.02",
+            "version_code": 50020126,
             "os": "android",
             "os_version": "14",
+            "install_ch": "ps",
             "device_id": device_id,
-            "install_store": "official",
-            "gaid": "1b2212c1-dadf-43c3-a0c8-bd6ce48ae22d",
+            "install_store": "ps",
+            "gaid": "",
             "brand": "Google",
-            "model": "Pixel 8",
+            "model": "Pixel 6",
             "system_language": "en",
-            "net": "NETWORK_WIFI",
+            "net": "wifi",
             "region": "IN",
-            "timezone": "Asia/Calcutta",
-            "sp_code": "",
+            "timezone": "Asia/Kolkata",
+            "sp_code": "404",
         },
         separators=(",", ":"),
     )
@@ -153,14 +155,22 @@ def build_auth_headers(method: str, url: str, body: str | None = None, token: st
     ts = int(time.time() * 1000)
     dev_id = device_id or generate_device_id()
     headers = {
-        "user-agent": MODERN_USER_AGENT,
+        "user-agent": "MovieBox/4.0.02 (Android 14; Pixel 6)",
         "accept": accept,
         "content-type": content_type,
         "connection": "keep-alive",
         "x-client-token": generate_x_client_token(ts),
         "x-tr-signature": generate_x_tr_signature(method, accept, content_type, url, body, ts, use_alt_key),
         "x-client-info": generate_client_info(dev_id),
-        "x-client-status": "0",
+        "x-client-status": "0" if token else "1",
+        "x-sign-version": "2.0",
+        "appid": "4U01pxRu278GqCZKY9",
+        "region": "IN",
+        "lang": "en",
+        "os": "android",
+        "x-timestamp": str(ts),
+        "referer": "https://api.inmoviebox.com/",
+        "x-play-mode": "2",
     }
     if token:
         headers["authorization"] = f"Bearer {token}"
@@ -294,8 +304,11 @@ class MovieBoxEngine:
                 pass
 
         # Some API versions return the guest token in visitor-login JSON.
-        login_url = f"{self.api_base}/wefeed-mobile-bff/user-api/visitor-login"
-        body = "{}"
+        login_url = f"{self.api_base}/wefeed-mobile-bff/user-api/visitor-login?host=api.inmoviebox.com"
+        body = json.dumps(
+            {"device_id": self.device_id, "deviceId": self.device_id},
+            separators=(",", ":"),
+        )
         login_headers = build_auth_headers(
             "POST", login_url, body=body, device_id=self.device_id,
             content_type="application/json;charset=UTF-8"
@@ -378,12 +391,18 @@ class MovieBoxEngine:
         if use_token and not self.bearer_token:
             self.bootstrap_token()
         body_str = json.dumps(body_dict, separators=(",", ":")) if body_dict is not None else None
+        # Android app adds the host query parameter before signing every native API call.
+        parsed = urlsplit(full_url)
+        if "host=" not in (parsed.query or ""):
+            separator = "&" if parsed.query else "?"
+            full_url = f"{full_url}{separator}host=api.inmoviebox.com"
         headers = build_auth_headers(
             method=method,
             url=full_url,
             body=body_str,
             token=self.bearer_token if use_token else None,
             device_id=self.device_id,
+            content_type="application/json;charset=UTF-8",
         )
         data_bytes = body_str.encode("utf-8") if body_str is not None else None
         if method.upper() == "POST":
