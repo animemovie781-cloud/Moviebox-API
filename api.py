@@ -422,8 +422,8 @@ class MovieBoxEngine:
             upstream_path = urlsplit(full_url).path
             raw_message = (resp.text or "").strip()
             safe_message = re.sub(
-                r"(?i)(bearer\\s+)[^\\s,;]+|((?:token|authorization|cookie|signature|secret)[\"'=:\\s]+)[^&\"'\\s,;]+",
-                r"\\1[REDACTED]",
+                r"(?i)(bearer\s+)[^\s,;]+|((?:token|authorization|cookie|signature|secret)["'=:\s]+)[^&"'\s,;]+",
+                r"\1[REDACTED]",
                 raw_message,
             )[:400]
             logger.warning(
